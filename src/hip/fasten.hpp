@@ -10,6 +10,12 @@
 #endif
 #define IMPL_CLS HipBude
 
+// Constant memory for broadcast ligand + forcefield data (outer loop)
+static constexpr int CONST_MAX_ATOMS = 4000;
+static constexpr int CONST_MAX_TYPES = 64;
+static __constant__ Atom d_ligand_const[CONST_MAX_ATOMS];
+static __constant__ FFParams d_forcefield_const[CONST_MAX_TYPES];
+
 template <size_t PPWI>
 static __global__ void fasten_main(int natlig, int natpro,
                                    const Atom *protein_molecule, //
@@ -70,10 +76,10 @@ static __global__ void fasten_main(int natlig, int natpro,
   // Loop over ligand atoms
   int il = 0;
   do {
-    // Load ligand atom data
-    const Atom l_atom = ligand_molecule[il];
+    // Load ligand atom data (from constant memory — scalar cache path)
+    const Atom l_atom = d_ligand_const[il];
 
-    const FFParams l_params = forcefield[l_atom.type];
+    const FFParams l_params = d_forcefield_const[l_atom.type];
     const bool lhphb_ltz = l_params.hphb < ZERO;
     const bool lhphb_gtz = l_params.hphb > ZERO;
 
@@ -256,6 +262,13 @@ public:
     auto contextEnd = now();
 
     sample.contextTime = {contextStart, contextEnd};
+
+    // Copy ligand + forcefield to constant memory (outer loop broadcast data)
+    if (p.natlig() > CONST_MAX_ATOMS || p.ntypes() > CONST_MAX_TYPES) {
+      throw std::runtime_error("Ligand atoms or forcefield types exceed constant memory limits");
+    }
+    checkError(hipMemcpyToSymbol(d_ligand_const, p.ligand.data(), p.natlig() * sizeof(Atom)));
+    checkError(hipMemcpyToSymbol(d_forcefield_const, p.forcefield.data(), p.ntypes() * sizeof(FFParams)));
 
     size_t global = std::ceil(double(p.nposes()) / PPWI);
     global = std::ceil(double(global) / double(wgsize));
