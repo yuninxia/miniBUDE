@@ -92,34 +92,60 @@ static __global__ void fasten_main(int natlig, int natpro,
     // Loop over protein atoms
     int ip = 0;
     do {
-      // Load protein atom data
-      const Atom p_atom = protein_molecule[ip];
+      // Scalar load protein atom data via s_load_dwordx4 (ISA-level optimization)
+      // All 64 lanes read same address — scalar load fetches ONE copy to SGPRs
+      // instead of 64 redundant vector loads, using lgkmcnt instead of vmcnt pipeline
+      typedef int v4si __attribute__((ext_vector_type(4)));
+      v4si p_atom_raw;
+      asm volatile(
+          "s_load_dwordx4 %0, %1, 0\n\t"
+          "s_waitcnt lgkmcnt(0)"
+          : "=s"(p_atom_raw)
+          : "s"(protein_molecule + ip)
+          : "memory"
+      );
+      const float p_atom_x = __int_as_float(p_atom_raw[0]);
+      const float p_atom_y = __int_as_float(p_atom_raw[1]);
+      const float p_atom_z = __int_as_float(p_atom_raw[2]);
+      const int p_atom_type = p_atom_raw[3];
 
-      const FFParams p_params = forcefield[p_atom.type];
+      // Scalar load forcefield params (also uniform — dependent on p_atom_type)
+      v4si p_params_raw;
+      asm volatile(
+          "s_load_dwordx4 %0, %1, 0\n\t"
+          "s_waitcnt lgkmcnt(0)"
+          : "=s"(p_params_raw)
+          : "s"(forcefield + p_atom_type)
+          : "memory"
+      );
+      const int p_hbtype = p_params_raw[0];
+      const float p_radius = __int_as_float(p_params_raw[1]);
+      const float p_hphb_val = __int_as_float(p_params_raw[2]);
+      const float p_elsc = __int_as_float(p_params_raw[3]);
 
-      const float radij = p_params.radius + l_params.radius;
+      const float radij = p_radius + l_params.radius;
       const float r_radij = 1.0f / radij;
 
-      const float elcdst = (p_params.hbtype == HBTYPE_F && l_params.hbtype == HBTYPE_F) ? FOUR : TWO;
-      const float elcdst1 = (p_params.hbtype == HBTYPE_F && l_params.hbtype == HBTYPE_F) ? QUARTER : HALF;
-      const bool type_E = ((p_params.hbtype == HBTYPE_E || l_params.hbtype == HBTYPE_E));
+      const float elcdst = (p_hbtype == HBTYPE_F && l_params.hbtype == HBTYPE_F) ? FOUR : TWO;
+      const float elcdst1 = (p_hbtype == HBTYPE_F && l_params.hbtype == HBTYPE_F) ? QUARTER : HALF;
+      const bool type_E = ((p_hbtype == HBTYPE_E || l_params.hbtype == HBTYPE_E));
 
-      const bool phphb_ltz = p_params.hphb < ZERO;
-      const bool phphb_gtz = p_params.hphb > ZERO;
-      const bool phphb_nz = p_params.hphb != ZERO;
-      const float p_hphb = p_params.hphb * (phphb_ltz && lhphb_gtz ? -ONE : ONE);
+      const bool phphb_ltz = p_hphb_val < ZERO;
+      const bool phphb_gtz = p_hphb_val > ZERO;
+      const bool phphb_nz = p_hphb_val != ZERO;
+      const float p_hphb = p_hphb_val * (phphb_ltz && lhphb_gtz ? -ONE : ONE);
       const float l_hphb = l_params.hphb * (phphb_gtz && lhphb_ltz ? -ONE : ONE);
       const float distdslv = (phphb_ltz ? (lhphb_ltz ? NPNPDIST : NPPDIST) : (lhphb_ltz ? NPPDIST : -FloatMax));
       const float r_distdslv = 1.0f / distdslv;
 
-      const float chrg_init = l_params.elsc * p_params.elsc;
+      const float chrg_init = l_params.elsc * p_elsc;
       const float dslv_init = p_hphb + l_hphb;
 
       for (int i = 0; i < PPWI; i++) {
         // Calculate distance between atoms
-        const float x = lpos[i].x - p_atom.x;
-        const float y = lpos[i].y - p_atom.y;
-        const float z = lpos[i].z - p_atom.z;
+        const float x = lpos[i].x - p_atom_x;
+        const float y = lpos[i].y - p_atom_y;
+        const float z = lpos[i].z - p_atom_z;
         const float distij = sqrt(x * x + y * y + z * z);
 
         // Calculate the sum of the sphere radii
