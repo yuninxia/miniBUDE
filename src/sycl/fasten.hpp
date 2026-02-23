@@ -101,6 +101,7 @@ template <size_t PPWI> class IMPL_CLS final : public Bude<PPWI> {
         }
 
         // Loop over protein atoms
+        #pragma unroll 4
         for (size_t ip = 0; ip < natpro; ip++) {
           // Load protein atom data
           const Atom p_atom = proteins[ip];
@@ -124,6 +125,7 @@ template <size_t PPWI> class IMPL_CLS final : public Bude<PPWI> {
           const float chrg_init = l_params.elsc * p_params.elsc;
           const float dslv_init = p_hphb + l_hphb;
 
+          #pragma unroll
           for (size_t i = 0; i < PPWI; i++) {
             // Calculate distance between atoms
             const float x = lpos[i].x() - p_atom.x;
