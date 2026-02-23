@@ -19,11 +19,11 @@ static __global__ void version(int *value) {
 
 template <size_t PPWI>
 static __global__ void fasten_main(int natlig, int natpro, int ntypes,
-                                   const Atom *protein_molecule, //
-                                   const Atom *ligand_molecule,  //
-                                   const float *transforms_0, const float *transforms_1, const float *transforms_2,
-                                   const float *transforms_3, const float *transforms_4, const float *transforms_5,
-                                   float *etotals, const FFParams *global_forcefield, int numTransforms) {
+                                   const Atom *__restrict__ protein_molecule, //
+                                   const Atom *__restrict__ ligand_molecule,  //
+                                   const float *__restrict__ transforms_0, const float *__restrict__ transforms_1, const float *__restrict__ transforms_2,
+                                   const float *__restrict__ transforms_3, const float *__restrict__ transforms_4, const float *__restrict__ transforms_5,
+                                   float *__restrict__ etotals, const FFParams *__restrict__ global_forcefield, int numTransforms) {
   // Get index of first TD
   int ix = blockIdx.x * blockDim.x * PPWI + threadIdx.x;
 
@@ -92,8 +92,8 @@ static __global__ void fasten_main(int natlig, int natpro, int ntypes,
     }
 
     // Loop over protein atoms
-    int ip = 0;
-    do {
+    #pragma unroll 4
+    for (int ip = 0; ip < natpro; ip++) {
       // Load protein atom data
       const Atom p_atom = protein_molecule[ip];
 
@@ -143,7 +143,7 @@ static __global__ void fasten_main(int natlig, int natpro, int ntypes,
         dslv_e *= (zone1 ? ONE : coeff);
         etot[i] += dslv_e;
       }
-    } while (++ip < natpro); // loop over protein atoms
+    } // loop over protein atoms
   } while (++il < natlig);   // loop over ligand atoms
 
   // Write results
