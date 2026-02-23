@@ -95,7 +95,9 @@ static __global__ void fasten_main(int natlig, int natpro, int ntypes,
     #pragma unroll 4
     for (int ip = 0; ip < natpro; ip++) {
       // Load protein atom data
-      const Atom p_atom = protein_molecule[ip];
+      // Load protein atom via read-only cache (float4 reinterpret for __ldg)
+      const float4 p_raw = __ldg(reinterpret_cast<const float4*>(&protein_molecule[ip]));
+      const Atom p_atom = {p_raw.x, p_raw.y, p_raw.z, __float_as_int(p_raw.w)};
 
       const FFParams p_params = forcefield[p_atom.type];
 
