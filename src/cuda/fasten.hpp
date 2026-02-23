@@ -73,7 +73,8 @@ static __global__ void fasten_main(int natlig, int natpro, int ntypes,
   int il = 0;
   do {
     // Load ligand atom data
-    const Atom l_atom = ligand_molecule[il];
+    const float4 l_raw = __ldg(reinterpret_cast<const float4*>(&ligand_molecule[il]));
+    const Atom l_atom = {l_raw.x, l_raw.y, l_raw.z, __float_as_int(l_raw.w)};
 
     const FFParams l_params = forcefield[l_atom.type];
     const bool lhphb_ltz = l_params.hphb < ZERO;
