@@ -17,24 +17,19 @@ template <size_t N> class bude_kernel_ndrange;
 
 template <size_t PPWI> class IMPL_CLS final : public Bude<PPWI> {
 
-  static constexpr sycl::access::mode R = sycl::access::mode::read;
-  static constexpr sycl::access::mode DW = sycl::access::mode::discard_write;
   static constexpr sycl::access::mode RW = sycl::access::mode::read_write;
-
-  static constexpr sycl::access::target Global = sycl::access::target::global_buffer;
   static constexpr sycl::access::target Local = sycl::access::target::local;
 
-  template <typename T, sycl::access::mode A = R> using accessor1 = sycl::accessor<T, 1, A, Global>;
-
-  static void fasten_main(sycl::handler &h,                                                           //
-                          size_t wgsize, size_t ntypes, size_t nposes,                                //
-                          const accessor1<Atom> &proteins,                                            //
-                          const accessor1<Atom> &ligands,                                             //
-                          const accessor1<FFParams> &forcefields,                                     //
-                          const accessor1<float> &transforms_0, const accessor1<float> &transforms_1, //
-                          const accessor1<float> &transforms_2, const accessor1<float> &transforms_3, //
-                          const accessor1<float> &transforms_4, const accessor1<float> &transforms_5, //
-                          const accessor1<float, DW> &energies) {
+  static void fasten_main(sycl::handler &h,                                                //
+                          size_t wgsize, size_t ntypes, size_t nposes,                     //
+                          size_t natlig, size_t natpro,                                     //
+                          const Atom *__restrict__ proteins,                                //
+                          const Atom *__restrict__ ligands,                                 //
+                          const FFParams *__restrict__ forcefields,                         //
+                          const float *__restrict__ transforms_0, const float *__restrict__ transforms_1, //
+                          const float *__restrict__ transforms_2, const float *__restrict__ transforms_3, //
+                          const float *__restrict__ transforms_4, const float *__restrict__ transforms_5, //
+                          float *__restrict__ energies) {
 
     size_t global = std::ceil(double(nposes) / PPWI);
     global = wgsize * size_t(std::ceil(double(global) / double(wgsize)));
@@ -51,14 +46,6 @@ template <size_t PPWI> class IMPL_CLS final : public Bude<PPWI> {
 
       size_t ix = gid * lrange * PPWI + lid;
       ix = ix < nposes ? ix : nposes - PPWI;
-
-      // XXX async_work_group_copy takes only gentypes, so no FFParams,
-      //  casting *_ptr<ElementType> parameter requires first converting to void and then to gentype
-      //  although probably free, there must be a better way of doing this
-      // sycl::device_event event = item.async_work_group_copy<float>(
-      //     sycl::local_ptr<float>(sycl::local_ptr<void>(local_forcefield.get_pointer())),
-      //     sycl::global_ptr<float>(sycl::global_ptr<void>(forcefields.get_pointer())),
-      //     ntypes * sizeof(FFParams) / sizeof(float));
 
       for (int i = lid; i < ntypes; i += lrange)
         local_forcefield[i] = forcefields[i];
@@ -91,11 +78,10 @@ template <size_t PPWI> class IMPL_CLS final : public Bude<PPWI> {
         etot[i] = ZERO;
       }
 
-      // item.wait_for(event);
       item.barrier(sycl::access::fence_space::local_space);
 
       // Loop over ligand atoms
-      for (size_t il = 0; il < ligands.get_count(); il++) {
+      for (size_t il = 0; il < natlig; il++) {
         // Load ligand atom data
         const Atom l_atom = ligands[il];
         const FFParams l_params = local_forcefield[l_atom.type];
@@ -115,7 +101,7 @@ template <size_t PPWI> class IMPL_CLS final : public Bude<PPWI> {
         }
 
         // Loop over protein atoms
-        for (size_t ip = 0; ip < proteins.get_count(); ip++) {
+        for (size_t ip = 0; ip < natpro; ip++) {
           // Load protein atom data
           const Atom p_atom = proteins[ip];
           const FFParams p_params = local_forcefield[p_atom.type];
@@ -144,12 +130,7 @@ template <size_t PPWI> class IMPL_CLS final : public Bude<PPWI> {
             const float y = lpos[i].y() - p_atom.y;
             const float z = lpos[i].z() - p_atom.z;
 
-            // XXX as of oneapi-2021.1-beta10, the sycl::native::sqrt variant is significantly slower for no apparent
-            // reason
             const float distij = sycl::sqrt(x * x + y * y + z * z);
-
-            // XXX as of oneapi-2021.1-beta10, the following variant is significantly slower for no apparent reason
-            // const float distij = sycl::distance(lpos[i], sycl::float3(p_atom.x, p_atom.y, p_atom.z));
 
             // Calculate the sum of the sphere radii
             const float distbb = distij - radij;
@@ -205,36 +186,63 @@ public:
 
     auto contextStart = now();
     sycl::queue queue(device);
-    sycl::buffer<Atom> proteins(p.protein.data(), p.protein.size());
-    sycl::buffer<Atom> ligands(p.ligand.data(), p.ligand.size());
-    sycl::buffer<FFParams> forcefields(p.forcefield.data(), p.forcefield.size());
-    sycl::buffer<float> transforms_0(p.poses[0].data(), p.poses[0].size());
-    sycl::buffer<float> transforms_1(p.poses[1].data(), p.poses[1].size());
-    sycl::buffer<float> transforms_2(p.poses[2].data(), p.poses[2].size());
-    sycl::buffer<float> transforms_3(p.poses[3].data(), p.poses[3].size());
-    sycl::buffer<float> transforms_4(p.poses[4].data(), p.poses[4].size());
-    sycl::buffer<float> transforms_5(p.poses[5].data(), p.poses[5].size());
-    sycl::buffer<float> energies(sample.energies.size());
+
+    // Allocate device memory (USM)
+    auto *d_proteins = sycl::malloc_device<Atom>(p.protein.size(), queue);
+    auto *d_ligands = sycl::malloc_device<Atom>(p.ligand.size(), queue);
+    auto *d_forcefields = sycl::malloc_device<FFParams>(p.forcefield.size(), queue);
+    auto *d_transforms_0 = sycl::malloc_device<float>(p.poses[0].size(), queue);
+    auto *d_transforms_1 = sycl::malloc_device<float>(p.poses[1].size(), queue);
+    auto *d_transforms_2 = sycl::malloc_device<float>(p.poses[2].size(), queue);
+    auto *d_transforms_3 = sycl::malloc_device<float>(p.poses[3].size(), queue);
+    auto *d_transforms_4 = sycl::malloc_device<float>(p.poses[4].size(), queue);
+    auto *d_transforms_5 = sycl::malloc_device<float>(p.poses[5].size(), queue);
+    auto *d_energies = sycl::malloc_device<float>(sample.energies.size(), queue);
+
+    // Copy input data from host to device
+    queue.memcpy(d_proteins, p.protein.data(), p.protein.size() * sizeof(Atom));
+    queue.memcpy(d_ligands, p.ligand.data(), p.ligand.size() * sizeof(Atom));
+    queue.memcpy(d_forcefields, p.forcefield.data(), p.forcefield.size() * sizeof(FFParams));
+    queue.memcpy(d_transforms_0, p.poses[0].data(), p.poses[0].size() * sizeof(float));
+    queue.memcpy(d_transforms_1, p.poses[1].data(), p.poses[1].size() * sizeof(float));
+    queue.memcpy(d_transforms_2, p.poses[2].data(), p.poses[2].size() * sizeof(float));
+    queue.memcpy(d_transforms_3, p.poses[3].data(), p.poses[3].size() * sizeof(float));
+    queue.memcpy(d_transforms_4, p.poses[4].data(), p.poses[4].size() * sizeof(float));
+    queue.memcpy(d_transforms_5, p.poses[5].data(), p.poses[5].size() * sizeof(float));
     queue.wait_and_throw();
+
     auto contextEnd = now();
     sample.contextTime = {contextStart, contextEnd};
 
     for (size_t i = 0; i < p.iterations + p.warmupIterations; ++i) {
       auto kernelStart = now();
       queue.submit([&](sycl::handler &h) {
-        fasten_main(h, wgsize, p.ntypes(), p.nposes(),                                                 //
-                    proteins.get_access<R>(h), ligands.get_access<R>(h), forcefields.get_access<R>(h), //
-                    transforms_0.get_access<R>(h), transforms_1.get_access<R>(h), transforms_2.get_access<R>(h),
-                    transforms_3.get_access<R>(h), transforms_4.get_access<R>(h), transforms_5.get_access<R>(h),
-                    energies.get_access<DW>(h));
+        fasten_main(h, wgsize, p.ntypes(), p.nposes(), p.natlig(), p.natpro(),  //
+                    d_proteins, d_ligands, d_forcefields,                        //
+                    d_transforms_0, d_transforms_1, d_transforms_2,              //
+                    d_transforms_3, d_transforms_4, d_transforms_5,              //
+                    d_energies);
       });
       queue.wait_and_throw();
       auto kernelEnd = now();
       sample.kernelTimes.emplace_back(kernelStart, kernelEnd);
     }
 
-    queue.submit([&](sycl::handler &h) { h.copy(energies.get_access<R>(h), sample.energies.data()); });
+    // Copy results back from device to host
+    queue.memcpy(sample.energies.data(), d_energies, sample.energies.size() * sizeof(float));
     queue.wait_and_throw();
+
+    // Free device memory
+    sycl::free(d_proteins, queue);
+    sycl::free(d_ligands, queue);
+    sycl::free(d_forcefields, queue);
+    sycl::free(d_transforms_0, queue);
+    sycl::free(d_transforms_1, queue);
+    sycl::free(d_transforms_2, queue);
+    sycl::free(d_transforms_3, queue);
+    sycl::free(d_transforms_4, queue);
+    sycl::free(d_transforms_5, queue);
+    sycl::free(d_energies, queue);
 
     return sample;
   };
